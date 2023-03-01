@@ -14,6 +14,8 @@ var DefaultExecAsync = func(f func()) {
 	}()
 }
 
+var jobEmpty job
+
 type job struct {
 	f    func()
 	next *job
@@ -30,8 +32,7 @@ func getJob() *job {
 }
 
 func putJob(jo *job) {
-	jo.f = nil
-	jo.next = nil
+	*jo = jobEmpty
 	jobPool.Put(jo)
 }
 
@@ -54,11 +55,12 @@ func (s *Serial) Go(f func()) {
 	if f == nil {
 		return
 	}
+
 	jo := getJob()
 	jo.f = f
 
 	s.mux.Lock()
-	if s.tail != nil {
+	if s.head != nil {
 		s.tail.next = jo
 		s.tail = jo
 		s.mux.Unlock()
@@ -70,20 +72,18 @@ func (s *Serial) Go(f func()) {
 	s.mux.Unlock()
 
 	s.execAsync(func() {
-		var next *job
+		next := jo
 		for {
-			s.execSync(jo.f)
+			s.execSync(next.f)
 			s.mux.Lock()
-			next = jo.next
-			putJob(jo)
+			s.head = next.next
+			putJob(next)
+			next = s.head
 			if next == nil {
-				s.head = nil
 				s.tail = nil
 				s.mux.Unlock()
 				return
 			}
-			jo = next
-			s.head = jo
 			s.mux.Unlock()
 		}
 	})
