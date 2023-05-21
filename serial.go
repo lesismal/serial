@@ -4,38 +4,6 @@ import (
 	"sync"
 )
 
-var DefaultExecSync = func(f func()) {
-	f()
-}
-
-var DefaultExecAsync = func(f func()) {
-	go func() {
-		f()
-	}()
-}
-
-var jobEmpty job
-
-type job struct {
-	f    func()
-	next *job
-}
-
-var jobPool = sync.Pool{
-	New: func() interface{} {
-		return &job{}
-	},
-}
-
-func getJob() *job {
-	return jobPool.Get().(*job)
-}
-
-func putJob(jo *job) {
-	*jo = jobEmpty
-	jobPool.Put(jo)
-}
-
 var serialPool = sync.Pool{
 	New: func() interface{} {
 		return &Serial{}
@@ -43,92 +11,81 @@ var serialPool = sync.Pool{
 }
 
 type Serial struct {
-	mux       sync.Mutex
-	head      *job
-	tail      *job
+	mux sync.Mutex
+
+	jobs      []*job
+	maxSize   int
 	execSync  func(f func())
 	execAsync func(f func())
-	// closed    bool
 }
 
 func (s *Serial) Go(f func()) {
 	if f == nil {
-		return
+		panic("nil value func")
 	}
 
 	jo := getJob()
 	jo.f = f
 
 	s.mux.Lock()
-	if s.head != nil {
-		s.tail.next = jo
-		s.tail = jo
-		s.mux.Unlock()
-		return
-	}
-
-	s.head = jo
-	s.tail = jo
+	isHead := (len(s.jobs) == 0)
+	s.jobs = append(s.jobs, jo)
 	s.mux.Unlock()
 
-	s.execAsync(func() {
-		next := jo
-		for {
-			s.execSync(next.f)
-			s.mux.Lock()
-			s.head = next.next
-			putJob(next)
-			next = s.head
-			if next == nil {
-				s.tail = nil
-				s.mux.Unlock()
-				return
-			}
-			s.mux.Unlock()
+	if isHead {
+		s.execAsync(func() {
+			s.doAll(jo)
+		})
+	}
+}
+
+func (s *Serial) GoWithValue(fv func(interface{}), v interface{}) {
+	if fv == nil {
+		panic("nil func")
+	}
+
+	jo := getJob()
+	jo.fv = fv
+	jo.v = v
+
+	s.mux.Lock()
+	isHead := (len(s.jobs) == 0)
+	s.jobs = append(s.jobs, jo)
+	s.mux.Unlock()
+
+	if isHead {
+		s.execAsync(func() {
+			s.doAll(jo)
+		})
+	}
+}
+
+func (s *Serial) doAll(jo *job) {
+	i := 0
+	for {
+		jo2 := jo
+		f := func() {
+			s.execSync(func() {
+				defer putJob(jo2)
+				if jo2.f != nil {
+					jo2.f()
+				}
+				if jo2.fv != nil {
+					jo2.fv(jo2.v)
+				}
+			})
 		}
-	})
-}
-
-func New(execSync, execAsync func(f func())) *Serial {
-	if execSync == nil {
-		execSync = DefaultExecSync
-	}
-	if execAsync == nil {
-		execAsync = DefaultExecAsync
-	}
-	return &Serial{
-		execSync:  execSync,
-		execAsync: execAsync,
-	}
-}
-
-type SerialFactory struct {
-	execSync  func(f func())
-	execAsync func(f func())
-}
-
-func (sf *SerialFactory) Get() *Serial {
-	s := serialPool.Get().(*Serial)
-	s.execSync = sf.execSync
-	s.execAsync = sf.execAsync
-	return s
-}
-
-func (sf *SerialFactory) Put(s *Serial) {
-	s.head = nil
-	s.tail = nil
-	serialPool.Put(s)
-}
-
-func NewFactory(execSync, execAsync func(f func())) *SerialFactory {
-	if execSync == nil {
-		execSync = DefaultExecSync
-	}
-	if execAsync == nil {
-		execAsync = DefaultExecAsync
-	}
-	return &SerialFactory{
-		execSync:  execSync,
-		execAsync: execAsync,
+		s.mux.Lock()
+		s.jobs[i] = nil
+		i++
+		if len(s.jobs) == i {
+			s.jobs = s.jobs[0:0]
+			s.mux.Unlock()
+			f()
+			return
+		}
+		jo = s.jobs[i]
+		s.mux.Unlock()
+		f()
 	}
 }
