@@ -1,91 +1,71 @@
 package serial
 
 import (
+	"log"
+	"runtime"
 	"sync"
+	"unsafe"
 )
 
-var serialPool = sync.Pool{
-	New: func() interface{} {
-		return &Serial{}
-	},
-}
-
 type Serial struct {
-	mux sync.Mutex
-
-	jobs      []*job
-	maxSize   int
-	execSync  func(f func())
-	execAsync func(f func())
+	idx     int
+	jobs    []func()
+	mux     sync.Mutex
+	running bool
+	caller  func(f func())
 }
 
 func (s *Serial) Go(f func()) {
-	if f == nil {
-		panic("nil value func")
-	}
-
-	jo := getJob()
-	jo.f = f
-
 	s.mux.Lock()
-	isHead := (len(s.jobs) == 0)
-	s.jobs = append(s.jobs, jo)
+	running := s.running
+	s.running = true
+	s.jobs = append(s.jobs, f)
 	s.mux.Unlock()
 
-	if isHead {
-		s.execAsync(func() {
-			s.doAll(jo)
-		})
+	if !running {
+		go s.doAll()
 	}
 }
 
-func (s *Serial) GoWithValue(fv func(interface{}), v interface{}) {
-	if fv == nil {
-		panic("nil func")
+func (s *Serial) doAll() {
+	caller := s.caller
+	if caller == nil {
+		caller = defaultCaller
 	}
-
-	jo := getJob()
-	jo.fv = fv
-	jo.v = v
-
-	s.mux.Lock()
-	isHead := (len(s.jobs) == 0)
-	s.jobs = append(s.jobs, jo)
-	s.mux.Unlock()
-
-	if isHead {
-		s.execAsync(func() {
-			s.doAll(jo)
-		})
-	}
-}
-
-func (s *Serial) doAll(jo *job) {
-	i := 0
+	var f func()
 	for {
-		jo2 := jo
-		f := func() {
-			s.execSync(func() {
-				defer putJob(jo2)
-				if jo2.f != nil {
-					jo2.f()
-				}
-				if jo2.fv != nil {
-					jo2.fv(jo2.v)
-				}
-			})
-		}
 		s.mux.Lock()
-		s.jobs[i] = nil
-		i++
-		if len(s.jobs) == i {
-			s.jobs = s.jobs[0:0]
+		if s.idx < len(s.jobs) {
+			f = s.jobs[s.idx]
+			s.jobs[s.idx] = nil
+			s.idx++
+		} else {
+			s.idx = 0
+			s.jobs = s.jobs[:0]
+			s.running = false
 			s.mux.Unlock()
-			f()
 			return
 		}
-		jo = s.jobs[i]
 		s.mux.Unlock()
-		f()
+		caller(f)
 	}
+}
+
+func New(caller func(f func())) *Serial {
+	if caller == nil {
+		caller = defaultCaller
+	}
+	return &Serial{jobs: make([]func(), 0, 10000), caller: caller}
+}
+
+func defaultCaller(f func()) {
+	defer func() {
+		if err := recover(); err != nil {
+			const size = 64 << 10
+			buf := make([]byte, size)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("execute failed: %v\n%v\n", err, *(*string)(unsafe.Pointer(&buf)))
+		}
+	}()
+	f()
 }
